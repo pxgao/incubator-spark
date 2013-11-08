@@ -41,3 +41,5 @@ derby.log
 dist/
 spark-*-bin.tar.gz
 unit-tests.log
+results/
+sql.txt

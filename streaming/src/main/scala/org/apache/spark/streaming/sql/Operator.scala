@@ -8,6 +8,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.actors.Actor._
 import scala.actors.Actor
 import org.apache.spark.Accumulator
+import org.apache.spark.Partitioner.defaultPartitioner
 /**
  * Created with IntelliJ IDEA.
  * User: peter
@@ -67,14 +68,19 @@ class InnerJoinOperatorSet(parentCtx : SqlSparkStreamingContext) extends Operato
   }
 
   def optimize(){
-    def build(remainingParents : mutable.Set[Operator], remainingOperators : mutable.PriorityQueue[InnerJoinOperator]) : mutable.Set[Operator] = {
+    def build(remainingParents : mutable.Set[Operator],
+              remainingOperators : mutable.PriorityQueue[InnerJoinOperator]) : mutable.Set[Operator] = {
       if(remainingOperators.size == 0){
         return remainingParents
       }else{
         val op = remainingOperators.dequeue()
         println("dequeue:" + op)
+
         val leftParent = remainingParents.filter(p => op.leftJoinSet.subsetOf(p.outputSchema.getGlobalIdSet)).head
-        val rightParent = remainingParents.filter(p => op.rightJoinSet.subsetOf(p.outputSchema.getGlobalIdSet) && p != leftParent).head
+
+        val rightParent = remainingParents
+          .filter(p => op.rightJoinSet.subsetOf(p.outputSchema.getGlobalIdSet) && p != leftParent).head
+
         op.setParents(leftParent, rightParent)
         remainingParents -= leftParent
         remainingParents -= rightParent
@@ -103,7 +109,8 @@ class InnerJoinOperatorSet(parentCtx : SqlSparkStreamingContext) extends Operato
   override def toString = {
     def toStrRecursive(op : Operator, depth : Int = 0) : String = {
       if(innerJoinOperators.exists(_ == op))
-        depth + ":" + op.toString + "\n" + op.parentOperators.map(p => toStrRecursive(p, depth + 1)).reduce(_ + "\n" + _)
+        depth + ":" + op.toString + "\n" +
+          op.parentOperators.map(p => toStrRecursive(p, depth + 1)).reduce(_ + "\n" + _)
       else
         ""
     }
@@ -213,19 +220,27 @@ class WindowOperator(parentOp : Operator, batches : Int, parentCtx : SqlSparkStr
     cached += exec.getTime -> resultFromParent
     cached = cached.filter(kvp => kvp._1 > exec.getTime - this.parentCtx.getBatchDuration * batches)
     cached.foreach(tp => tp._2.foreach(_.persist(this.parentCtx.defaultStorageLevel)))
-    cached.flatMap(tp => tp._2).toArray
+    if(this.parentCtx.args.contains("-union")){
+      Array(this.parentCtx.ssc.sc.union( cached.flatMap(tp => tp._2).toSeq))
+    }else{
+      cached.flatMap(tp => tp._2).toArray
+    }
   }
 
 }
 
 
-class SelectOperator(parentOp : Operator, selectColGlobalId : IndexedSeq[Int], parentCtx : SqlSparkStreamingContext) extends UnaryOperator {
+class SelectOperator(parentOp : Operator,
+                     selectColGlobalId : IndexedSeq[Int],
+                     parentCtx : SqlSparkStreamingContext) extends UnaryOperator {
+
   sqlContext = parentCtx
   sqlContext.operatorGraph.addOperator(this)
   var isSelectAll = false
   var localColId = IndexedSeq[Int]()
   setParent(parentOp)
-  outputSchema = new Schema(selectColGlobalId.map(gid => (parentOperators.head.outputSchema.getClassFromGlobalId(gid),gid)))
+  outputSchema = new Schema(selectColGlobalId
+    .map(gid => (parentOperators.head.outputSchema.getClassFromGlobalId(gid),gid)))
 
   var cached = Map[RDD[IndexedSeq[Any]], RDD[IndexedSeq[Any]]]()
 
@@ -257,7 +272,11 @@ class SelectOperator(parentOp : Operator, selectColGlobalId : IndexedSeq[Int], p
   override def toString = super.toString + selectColGlobalId
 }
 
-class WhereOperator(parentOp : Operator, func : (IndexedSeq[Any], Schema) => Boolean, whereColumnId : Set[Int], parentCtx : SqlSparkStreamingContext) extends UnaryOperator{
+class WhereOperator(parentOp : Operator,
+                    func : (IndexedSeq[Any],
+                      Schema) => Boolean, whereColumnId : Set[Int],
+                    parentCtx : SqlSparkStreamingContext) extends UnaryOperator{
+
   sqlContext = parentCtx
   sqlContext.operatorGraph.addOperator(this)
   setParent(parentOp)
@@ -290,7 +309,12 @@ class WhereOperator(parentOp : Operator, func : (IndexedSeq[Any], Schema) => Boo
   override def toString = super.toString + whereColumnId + "Sel:" + selectivity
 }
 
-class GroupByCombiner(createCombiner : Any, mergeValue : Any, mergeCombiners : Any, finalProcessing : Any, resultType : String) extends Serializable{
+class GroupByCombiner(createCombiner : Any,
+                      mergeValue : Any,
+                      mergeCombiners : Any,
+                      finalProcessing : Any,
+                      resultType : String) extends Serializable{
+
   def getCreateCombiner = createCombiner.asInstanceOf[Any=>Any]
   def getMergeValue = mergeValue.asInstanceOf[(Any,Any)=>Any]
   def getMergeCombiners = mergeCombiners.asInstanceOf[(Any,Any)=>Any]
@@ -298,7 +322,11 @@ class GroupByCombiner(createCombiner : Any, mergeValue : Any, mergeCombiners : A
   def getResultType = resultType
 }
 
-class GroupByOperator(parentOp : Operator, keyColumnsArr : IndexedSeq[Int], functions : Map[Int, GroupByCombiner], parentCtx : SqlSparkStreamingContext) extends UnaryOperator{
+class GroupByOperator(parentOp : Operator,
+                      keyColumnsArr : IndexedSeq[Int],
+                      functions : Map[Int, GroupByCombiner],
+                      parentCtx : SqlSparkStreamingContext) extends UnaryOperator{
+
   sqlContext = parentCtx
   sqlContext.operatorGraph.addOperator(this)
 
@@ -325,7 +353,7 @@ class GroupByOperator(parentOp : Operator, keyColumnsArr : IndexedSeq[Int], func
 
   override def execute(exec : Execution) : Array[RDD[IndexedSeq[Any]]] = {
     val rddPair = parentOperators.head.execute(exec).map(rdd => (rdd, {
-      if(this.parentCtx.args.contains("-incre") && this.parentCtx.incrementalOperator && cached.contains(rdd)){
+      if(this.parentCtx.args.contains("-incre") && cached.contains(rdd)){
         cached(rdd)
       }
       else
@@ -333,12 +361,14 @@ class GroupByOperator(parentOp : Operator, keyColumnsArr : IndexedSeq[Int], func
     })).toMap
     val unioned = this.parentCtx.ssc.sc.union[(IndexedSeq[Any],IndexedSeq[Any])](rddPair.values.toSeq)
     val result = Array[RDD[IndexedSeq[Any]]](mergeBatch(unioned))
-//    cached.foreach(kvp =>
-//      if(!rddPair.contains(kvp._1))
-//        kvp._2.unpersist(false)
-//    )
-    cached = rddPair
-    cached.foreach(kvp => kvp._2.persist(this.parentCtx.defaultStorageLevel))
+    if(this.parentCtx.args.contains("-incre")){
+      cached.foreach(kvp =>
+        if(!rddPair.contains(kvp._1))
+          kvp._2.unpersist(false)
+      )
+      cached = rddPair
+      cached.foreach(kvp => kvp._2.persist(this.parentCtx.defaultStorageLevel))
+    }
     result
   }
 
@@ -390,7 +420,8 @@ class GroupByOperator(parentOp : Operator, keyColumnsArr : IndexedSeq[Int], func
     val localFunctions = this.functions.map(kvp => (parentOp.outputSchema.getLocalIdFromGlobalId(kvp._1), kvp._2) )
     val localValueFunctions = localFunctions.zipWithIndex.map(kvp => (kvp._2,kvp._1._2))//the location in the groupby columns
 
-    rdd.reduceByKey((x,y) => mergeCombiners(x,y,localValueFunctions)).map(kvp => kvp._1 ++ finalProcessing(kvp._2,localValueFunctions))
+    rdd.reduceByKey((x,y) => mergeCombiners(x,y,localValueFunctions))
+      .map(kvp => kvp._1 ++ finalProcessing(kvp._2,localValueFunctions))
 
   }
 
@@ -400,7 +431,10 @@ class GroupByOperator(parentOp : Operator, keyColumnsArr : IndexedSeq[Int], func
 
 
 
-class ParseOperator(schema : Schema, delimiter : String, inputStreamName : String, parentCtx : SqlSparkStreamingContext) extends UnaryOperator {
+class ParseOperator(schema : Schema,
+                    delimiter : String,
+                    inputStreamName : String,
+                    parentCtx : SqlSparkStreamingContext) extends UnaryOperator {
   sqlContext = parentCtx
   sqlContext.operatorGraph.addOperator(this)
   outputSchema = schema
@@ -443,13 +477,17 @@ class ParseOperator(schema : Schema, delimiter : String, inputStreamName : Strin
 }
 
 
-class OutputOperator(parentOp : Operator, selectColGlobalId : IndexedSeq[Int], parentCtx : SqlSparkStreamingContext) extends UnaryOperator {
+class OutputOperator(parentOp : Operator,
+                     selectColGlobalId : IndexedSeq[Int],
+                     parentCtx : SqlSparkStreamingContext) extends UnaryOperator {
   sqlContext = parentCtx
   sqlContext.operatorGraph.addOperator(this)
   var isSelectAll = false
   var localColId = IndexedSeq[Int]()
   setParent(parentOp)
-  outputSchema = new Schema(selectColGlobalId.map(gid => (parentOperators.head.outputSchema.getClassFromGlobalId(gid),gid)))
+  outputSchema = new Schema(
+    selectColGlobalId.map(gid => (parentOperators.head.outputSchema.getClassFromGlobalId(gid),gid))
+  )
 
   override def setParent(parentOp : Operator){
 
@@ -475,59 +513,140 @@ class OutputOperator(parentOp : Operator, selectColGlobalId : IndexedSeq[Int], p
 }
 
 
-class InnerJoinOperator(parentOp1 : Operator, parentOp2 : Operator, joinCondition : IndexedSeq[(Int, Int)], parentCtx : SqlSparkStreamingContext) extends BinaryOperator {
+class InnerJoinOperator(parentOp1 : Operator,
+                        parentOp2 : Operator,
+                        joinCondition : IndexedSeq[(Int, Int)],
+                        parentCtx : SqlSparkStreamingContext) extends BinaryOperator {
   sqlContext = parentCtx
   sqlContext.operatorGraph.addOperator(this)
   var getLocalIdFromGlobalId = Map[Int,Int]()
+  var localJoinCondition : IndexedSeq[(Int,Int)] = null
   setParents(parentOp1, parentOp2)
   val leftJoinSet = joinCondition.map(tp=>tp._1).toSet
   val rightJoinSet = joinCondition.map(tp=>tp._2).toSet
 
+
+
   var cached = Map[(RDD[IndexedSeq[Any]], RDD[IndexedSeq[Any]]), RDD[IndexedSeq[Any]]]()
+  var leftShuffleCache = Map[RDD[IndexedSeq[Any]], RDD[(IndexedSeq[Any], IndexedSeq[Any])]]()
+  var rightShuffleCache = Map[RDD[IndexedSeq[Any]], RDD[(IndexedSeq[Any], IndexedSeq[Any])]]()
 
   var selectivity : Double = 1.0
 
   override def setParents(parentOp1 : Operator, parentOp2 : Operator){
     super.setParents(parentOp1, parentOp2)
-    joinCondition.foreach(tp => assert(parentOp1.outputSchema.getClassFromGlobalId(tp._1) == parentOp2.outputSchema.getClassFromGlobalId(tp._2)))
-    outputSchema = new Schema(parentOp1.outputSchema.getSchemaArray.toSet.union(parentOp2.outputSchema.getSchemaArray.toSet).toArray.sortBy(_._2))
+
+    joinCondition.foreach(tp =>
+      assert(parentOp1.outputSchema.getClassFromGlobalId(tp._1) == parentOp2.outputSchema.getClassFromGlobalId(tp._2))
+    )
+
+    outputSchema = new Schema(
+      parentOp1.outputSchema.getSchemaArray.toSet.union(parentOp2.outputSchema.getSchemaArray.toSet).toArray.sortBy(_._2)
+    )
+
     val left = parentOp1.outputSchema.getLocalIdFromGlobalId
     val right = parentOp2.outputSchema.getLocalIdFromGlobalId.map(kvp => (kvp._1, kvp._2 + left.size))
     getLocalIdFromGlobalId = left ++ right
+
+    localJoinCondition = joinCondition.map(tp =>
+      (parentOperators(0).outputSchema.getLocalIdFromGlobalId(tp._1),
+        parentOperators(1).outputSchema.getLocalIdFromGlobalId(tp._2))
+    )
   }
 
 
   override def execute(exec : Execution) : Array[RDD[IndexedSeq[Any]]] = {
+
+
+
     val leftParentResult = parentOperators(0).execute(exec)
     val rightParentResult = parentOperators(1).execute(exec)
+
+    val leftShuffleMap = leftParentResult.map(result => (
+      result,
+      if(leftShuffleCache.contains(result)){
+        leftShuffleCache(result)
+      }
+      else{
+        val localJoinCondition = this.localJoinCondition
+        result.map(
+          record => (localJoinCondition.map(tp => record(tp._1)),record))
+          .partitionBy(defaultPartitioner(result))
+      }
+    )).toMap
+
+    leftShuffleCache.foreach(tp => {
+      if(!leftShuffleCache.contains(tp._1))
+        tp._2.unpersist(false)
+    })
+
+    leftShuffleMap.foreach(_._2.persist(this.parentCtx.defaultStorageLevel))
+    leftShuffleCache = leftShuffleMap
+
+
+
+
+    val rightShuffleMap = rightParentResult.map(result => (
+      result,
+      if(rightShuffleCache.contains(result)){
+        rightShuffleCache(result)
+      }
+      else{
+        val localJoinCondition = this.localJoinCondition
+        result.map(
+          record => (localJoinCondition.map(tp => record(tp._1)),record))
+          .partitionBy(defaultPartitioner(result))
+      }
+      )).toMap
+
+    rightShuffleCache.foreach(tp => {
+      if(!rightShuffleCache.contains(tp._1))
+        tp._2.unpersist(false)
+    })
+
+    rightShuffleMap.foreach(_._2.persist(this.parentCtx.defaultStorageLevel))
+    rightShuffleCache = rightShuffleMap
+
+
+
+
     var result = Map[(RDD[IndexedSeq[Any]], RDD[IndexedSeq[Any]]), RDD[IndexedSeq[Any]]]()
+
     for(leftRdd <- leftParentResult ; rightRdd <- rightParentResult){
       val res :  RDD[IndexedSeq[Any]] =
         if(this.parentCtx.args.contains("-incre") && cached.contains((leftRdd, rightRdd))){
           cached((leftRdd, rightRdd))
         }
-        else
-          join(leftRdd, rightRdd)
+        else{
+          val leftShuffled = leftShuffleMap(leftRdd)
+          val rightShuffled = rightShuffleMap(rightRdd)
+          join(leftShuffled, rightShuffled)
+        }
       result += (leftRdd, rightRdd) -> res
     }
-    result.foreach(tp => tp._2.persist(this.parentCtx.defaultStorageLevel))
-    cached = result
+
+
+    if(this.parentCtx.args.contains("-incre")){
+      result.foreach(tp => tp._2.persist(this.parentCtx.defaultStorageLevel))
+      cached.foreach(tp => {
+        if(!result.contains(tp._1))
+          tp._2.unpersist(false)
+      })
+      cached = result
+    }
     result.values.toArray
   }
 
 
-  def join(left : RDD[IndexedSeq[Any]], right : RDD[IndexedSeq[Any]]) = {
-    val localJoinCondition = joinCondition.map(tp => (parentOperators(0).outputSchema.getLocalIdFromGlobalId(tp._1), parentOperators(1).outputSchema.getLocalIdFromGlobalId(tp._2)))
+  def join(leftPartitioned : RDD[(IndexedSeq[Any],IndexedSeq[Any])],
+           rightPartitioned : RDD[(IndexedSeq[Any],IndexedSeq[Any])]) = {
+
     val getLocalIdFromGlobalId = this.getLocalIdFromGlobalId
     val outputSchema = this.outputSchema
 
 
-    val rdd1 = left.map(record => (localJoinCondition.map(tp => record(tp._1)),record))
-    val rdd2 = right.map(record => (localJoinCondition.map(tp => record(tp._2)),record))
 
-
-    //use a fully random partitioner, and then map partition
-    val joined = rdd1.join(rdd2)
+    val joined = leftPartitioned.join(rightPartitioned)
     val result = joined.map(pair => {
       val combined = pair._2._1 ++ pair._2._2
       outputSchema.getSchemaArray.map(kvp => combined(getLocalIdFromGlobalId(kvp._2)))
@@ -535,44 +654,45 @@ class InnerJoinOperator(parentOp1 : Operator, parentOp2 : Operator, joinConditio
     )
 
 
-    if(this.parentCtx.args.contains("-reorder")){
-      val joinAcc = parentCtx.ssc.sc.accumulator(0L)
-      val rdd1Acc = parentCtx.ssc.sc.accumulator(0L)
-      val rdd2Acc = parentCtx.ssc.sc.accumulator(0L)
-
-      joined.foreach(l => joinAcc += 1)
-      rdd1.foreach(l => rdd1Acc += 1)
-      rdd2.foreach(l => rdd2Acc += 1)
-
-      getSelectivityActor ! (rdd1Acc,rdd2Acc, joinAcc)
-    }
+//    if(this.parentCtx.args.contains("-reorder")){
+//      val joinAcc = parentCtx.ssc.sc.accumulator(0L)
+//      val rdd1Acc = parentCtx.ssc.sc.accumulator(0L)
+//      val rdd2Acc = parentCtx.ssc.sc.accumulator(0L)
+//
+//      joined.foreach(l => joinAcc += 1)
+//      leftPartitioned.foreach(l => rdd1Acc += 1)
+//      rightPartitioned.foreach(l => rdd2Acc += 1)
+//
+//      getSelectivityActor ! (rdd1Acc,rdd2Acc, joinAcc)
+//    }
 
 
     result
   }
 
 
-  val getSelectivityActor = actor{
-    while(true){
-      try{
-        receive{
-          case (rdd1Acc : Accumulator[Long], rdd2Acc :Accumulator[Long], joinAcc : Accumulator[Long]) =>
-          {
-            val joinedSize = joinAcc.value
-            val rdd1Size = rdd1Acc.value
-            val rdd2Size = rdd2Acc.value
-            if(rdd1Size > 0 && rdd2Size > 0)
-            {
-              selectivity = joinedSize.toDouble /(rdd1Size * rdd2Size)
-            }
-          }
-        }
-      }catch{
-        case e : Exception => e.printStackTrace()
-      }
-    }
-  }
+//  val getSelectivityActor = actor{
+//    while(true){
+//      try{
+//        receive{
+//          case (rdd1Acc : Accumulator[Long], rdd2Acc :Accumulator[Long], joinAcc : Accumulator[Long]) =>
+//          {
+//            val joinedSize = joinAcc.value
+//            val rdd1Size = rdd1Acc.value
+//            val rdd2Size = rdd2Acc.value
+//            if(rdd1Size > 0 && rdd2Size > 0)
+//            {
+//              selectivity = joinedSize.toDouble /(rdd1Size * rdd2Size)
+//            }
+//          }
+//        }
+//      }catch{
+//        case e : Exception => e.printStackTrace()
+//      }
+//    }
+//  }
 
   def getJoinCondition = joinCondition
+
   override def toString = super.toString + joinCondition + " Sel:" + selectivity
 }

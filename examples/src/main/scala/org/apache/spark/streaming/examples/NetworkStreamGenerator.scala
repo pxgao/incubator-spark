@@ -110,7 +110,7 @@ class Server(port : Int, _mean:Double = 0.0, _sd : Double = 100.0) extends Threa
          else if(count%(NetworkStreamGenerator.rps/1000) == 0)
           Thread.sleep(1)
         }
-
+        println("connection closed:" + port)
         out.close()
         socket.close()
       }

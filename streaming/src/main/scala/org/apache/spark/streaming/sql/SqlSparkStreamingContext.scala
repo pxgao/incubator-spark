@@ -10,6 +10,7 @@ import java.util.Calendar
 import scala.Tuple2
 
 
+
 /**
  * Created with IntelliJ IDEA.
  * User: peter
@@ -24,15 +25,21 @@ class SqlSparkStreamingContext(master: String,
                                jars: Seq[String] = Nil,
                                environment: Map[String, String] = Map()) {
   val ssc = new StreamingContext(master, appName, batchDuration,sparkHome, jars, environment)
+
   val defaultStorageLevel = org.apache.spark.storage.StorageLevel.MEMORY_ONLY_SER
+
   val inputStreams = scala.collection.mutable.Map[String, DStream[String]]()
+
   val recentBatchOfInputStreams = scala.collection.mutable.Map[Time, scala.collection.mutable.Map[String, RDD[String]]]()
+
   val operatorGraph = new OperatorGraph(this)
+
   val tables = scala.collection.mutable.Map[String, Table]()
+
   val parser = new SqlParser()
+
   var args :Array[String] = null
 
-  var incrementalOperator = true
 
   def getBatchDuration = batchDuration
 
@@ -56,7 +63,9 @@ class SqlSparkStreamingContext(master: String,
 
         if (!recentBatchOfInputStreams.contains(time))
           recentBatchOfInputStreams += time -> scala.collection.mutable.Map[String, RDD[String]]()
+
         recentBatchOfInputStreams(time) += name -> rdd
+
         if(recentBatchOfInputStreams(time).keySet == inputStreams.keys){
           processRDDActor ! (time,recentBatchOfInputStreams(time))
           //processBatch(time, recentBatchOfInputStreams(time))
@@ -88,39 +97,55 @@ class SqlSparkStreamingContext(master: String,
   var timeSum = 0.0
   var batchCount = 0
   var usedCount = 0
+
+
   def processBatch(time:Time, rdds : scala.collection.mutable.Map[String, RDD[String]]){
-   val optimizeStart = System.nanoTime()
-    if(args.contains("-reorder"))
-      operatorGraph.innerJoinOperatorSets.foreach(s => s.optimize())
     println("running " + time)
 
     rdds.foreach(tp => println(time + " " +tp._2.count()))
 
+    val optimizeStart = System.nanoTime()
+    if(args.contains("-reorder"))
+      operatorGraph.innerJoinOperatorSets.foreach(s => s.optimize())
+
+
+
     val starttime = System.nanoTime()
     val exec = new Execution(time,rdds)
+
+
     operatorGraph.execute(SqlHelper.printRDD,exec)
+
     val timeUsed = (System.nanoTime() - starttime)/1000000.0
+
     if(batchCount > 10){
       timeSum += timeUsed
       usedCount += 1
     }
+
     batchCount += 1
+
     println("optimization time in ms:" + (starttime - optimizeStart)/1000000.0 )
     println("execution time in ms:" + timeUsed + " Avg:" + (timeSum/usedCount))
+
     SqlHelper.writeln(timeUsed.toString)
+
     operatorGraph.innerJoinOperators.foreach(println(_))
   }
 
 
   def executeQuery(q : Any) = q match{
+
     case (t:Identifier, s:SelectStatement) => {
       executeSelectQuery(t,s)
     }
     case (t:Identifier, s:InputStatement) => {
       socketTextStream(s.ip, s.port, t.name + "_input")
+
       val nameTypeGID = s.column.map(tp => (tp._1,(tp._2, columns.getGlobalColId))).toMap
       val schema = new Schema(nameTypeGID.values.toIndexedSeq)
       val operator = new ParseOperator(schema, s.dilimiter, t.name + "_input",this)
+
       tables += t.name -> new Table(nameTypeGID, operator)
     }
     case o:OutputStatement =>{
@@ -224,11 +249,13 @@ class SqlSparkStreamingContext(master: String,
       val whereColName = condition.GetVariableSet()
       val whereColGID = whereColName.map(name => fromTable.getTypeGIDFromName(name)._2)
       val getColumnGIdFromName = fromTable.getTypeGIDFromName.filter(tp => whereColName(tp._1)).map(tp => (tp._1, tp._2._2))
+
       val f = (record : IndexedSeq[Any], schema : Schema) => {
         val _condition : Condition = condition
         val _getColumnLocalIdFromName = getColumnGIdFromName.map(tp => (tp._1, schema.getLocalIdFromGlobalId(tp._2)))
         condition.Eval(_getColumnLocalIdFromName, record)
       }
+
       tailOperator = new WhereOperator(tailOperator, f, whereColGID, this)
     }
     if(sql.contains("window")){
@@ -271,9 +298,11 @@ class SqlSparkStreamingContext(master: String,
     if(sql.contains("join")){
       sql("join").asInstanceOf[List[JoinStatement]].foreach(j => {
         val rightTable = tables(j.table.name)
+
         if(j.joinType == "inner"){
           val leftParent = tailOperator
           val rightParent = rightTable.getSinkOperator
+
           val joinCond = j.onCol.map(tp => {
             if(joinedTables.contains(tp._1.table.name)
               && tp._2.table.name == j.table.name){
@@ -299,11 +328,13 @@ class SqlSparkStreamingContext(master: String,
               throw new Exception("join condition mismatch")
             }
           }).toIndexedSeq
+
           joinedTables += j.table.name -> tables(j.table.name)
           tailOperator = new InnerJoinOperator(leftParent,rightParent, joinCond, this)
 
           val getNameTypeFromGID = getTypeGIDFromName.map(tp => (tp._2._2,(tp._1,tp._2._1))).toMap
           val rightTable_getNameTypeFromGID = rightTable.getTypeGIDFromName.map(tp => (tp._2._2,(tp._1,tp._2._1))).toMap
+
           getTypeGIDFromName = tailOperator.outputSchema.getSchemaArray.map(tp => {
             (
             if(getNameTypeFromGID.contains(tp._2)){

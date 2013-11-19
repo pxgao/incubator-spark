@@ -7,7 +7,7 @@ import org.apache.spark.SparkContext._
 import scala.collection.mutable.ArrayBuffer
 import scala.actors.Actor._
 import scala.actors.Actor
-import org.apache.spark.Accumulator
+import org.apache.spark.{HashPartitioner, Accumulator}
 import org.apache.spark.Partitioner.defaultPartitioner
 import org.apache.spark.broadcast.Broadcast
 
@@ -219,9 +219,11 @@ class WindowOperator(parentOp : Operator, batches : Int, parentCtx : SqlSparkStr
 
   override def execute(exec : Execution) : Array[RDD[IndexedSeq[Any]]] = {
     val resultFromParent = parentOperators.head.execute(exec)
+    resultFromParent.foreach(_.persist(this.parentCtx.defaultStorageLevel))
     cached += exec.getTime -> resultFromParent
+    cached.foreach(kvp => if( !(kvp._1 > exec.getTime - this.parentCtx.getBatchDuration * batches)) kvp._2.foreach(_.unpersist(false)))
     cached = cached.filter(kvp => kvp._1 > exec.getTime - this.parentCtx.getBatchDuration * batches)
-    cached.foreach(tp => tp._2.foreach(_.persist(this.parentCtx.defaultStorageLevel)))
+
     if(this.parentCtx.args.contains("-union")){
       Array(this.parentCtx.ssc.sc.union( cached.flatMap(tp => tp._2).toSeq))
     }else{
@@ -275,8 +277,7 @@ class SelectOperator(parentOp : Operator,
 }
 
 class WhereOperator(parentOp : Operator,
-                    func : (IndexedSeq[Any],
-                      Schema) => Boolean, whereColumnId : Set[Int],
+                    func : (IndexedSeq[Any], Schema) => Boolean, whereColumnId : Set[Int],
                     parentCtx : SqlSparkStreamingContext) extends UnaryOperator{
 
   sqlContext = parentCtx
@@ -347,6 +348,8 @@ class GroupByOperator(parentOp : Operator,
 
   def getKeyColumnsArr = keyColumnsArr
   def getFunctions = functions
+
+  var partitioner = new HashPartitioner(parentCtx.ssc.sc.defaultParallelism)
 
   override def setParent(parentOp : Operator){
     super.setParent(parentOp)
@@ -422,8 +425,9 @@ class GroupByOperator(parentOp : Operator,
     kvpRdd.combineByKey[IndexedSeq[Any]](
       (x : IndexedSeq[Any]) => createCombiner(x,localValueFunctions),
       (x : IndexedSeq[Any],y : IndexedSeq[Any])=>mergeValue(x,y,localValueFunctions),
-      (x : IndexedSeq[Any],y : IndexedSeq[Any])=>mergeCombiners(x,y,localValueFunctions)
-    ).map(kvp => (kvp._1,kvp._2))
+      (x : IndexedSeq[Any],y : IndexedSeq[Any])=>mergeCombiners(x,y,localValueFunctions),
+      partitioner
+    ).asInstanceOf[RDD[(IndexedSeq[Any],IndexedSeq[Any])]]
 //    val reduced = combined.mapValues(finalProcessing(_,localValueFunctions))
 //    val rr = reduced.map(kvp => kvp._1 ++ kvp._2)
 //    rr.map(arr => arr.toIndexedSeq)
@@ -519,9 +523,9 @@ class OutputOperator(parentOp : Operator,
   }
 
   override def execute(exec : Execution) : Array[RDD[IndexedSeq[Any]]] = {
-    val rdd = this.parentCtx.ssc.sc.union[IndexedSeq[Any]]( parentOperators.head.execute(exec).toSeq)
+    val rdd = this.parentCtx.ssc.sc.union( parentOperators.head.execute(exec) )
 
-    val returnRDD =
+    Array(
       if(isSelectAll)
         rdd
       else{
@@ -530,7 +534,8 @@ class OutputOperator(parentOp : Operator,
         //SqlHelper.printRDD(rdd)
         rdd.map(record => localColId.map(id => record(id)) )
       }
-    Array(returnRDD)
+    )
+
   }
 }
 
@@ -555,6 +560,8 @@ class InnerJoinOperator(parentOp1 : Operator,
   var rightShuffleCache = Map[RDD[IndexedSeq[Any]], RDD[(IndexedSeq[Any], IndexedSeq[Any])]]()
 
   var selectivity : Double = 1.0
+
+  var partitioner = new HashPartitioner(parentCtx.ssc.sc.defaultParallelism)
 
   override def setParents(parentOp1 : Operator, parentOp2 : Operator){
     super.setParents(parentOp1, parentOp2)
@@ -596,7 +603,7 @@ class InnerJoinOperator(parentOp1 : Operator,
         val localJoinCondition = this.localJoinCondition
         result.map(
           record => (localJoinCondition.value.map(tp => record(tp._1)),record))
-          .partitionBy(defaultPartitioner(result))
+          .partitionBy(partitioner)
       }
     )).toMap
 
@@ -620,7 +627,7 @@ class InnerJoinOperator(parentOp1 : Operator,
         val localJoinCondition = this.localJoinCondition
         result.map(
           record => (localJoinCondition.value.map(tp => record(tp._1)),record))
-          .partitionBy(defaultPartitioner(result))
+          .partitionBy(partitioner)
       }
       )).toMap
 
@@ -642,7 +649,8 @@ class InnerJoinOperator(parentOp1 : Operator,
         if(this.parentCtx.args.contains("-incre") && cached.contains((leftRdd, rightRdd))){
           cached((leftRdd, rightRdd))
         }
-        else{
+        else
+        {
           val leftShuffled = leftShuffleMap(leftRdd)
           val rightShuffled = rightShuffleMap(rightRdd)
           join(leftShuffled, rightShuffled)

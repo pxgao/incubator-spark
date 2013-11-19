@@ -61,6 +61,8 @@ class SqlSparkStreamingContext(master: String,
       val stream = kvp._2
       stream.foreach((rdd,time) => {
 
+        rdd.persist(this.defaultStorageLevel)
+
         if (!recentBatchOfInputStreams.contains(time))
           recentBatchOfInputStreams += time -> scala.collection.mutable.Map[String, RDD[String]]()
 
@@ -89,6 +91,7 @@ class SqlSparkStreamingContext(master: String,
         case (time:Time, rdds :scala.collection.mutable.Map[String, RDD[String]]) =>
         {
           processBatch(time,rdds)
+          rdds.values.foreach(_.unpersist(false))
         }
       }
     }

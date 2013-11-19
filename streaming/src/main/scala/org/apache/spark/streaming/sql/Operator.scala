@@ -352,6 +352,17 @@ class GroupByOperator(parentOp : Operator,
   }
 
   override def execute(exec : Execution) : Array[RDD[IndexedSeq[Any]]] = {
+    val mergeCombiners = (x : IndexedSeq[Any], y : IndexedSeq[Any], func : Map[Int, GroupByCombiner]) => {
+      func.map(kvp => kvp._2.getMergeCombiners(x(kvp._1), y(kvp._1))).toIndexedSeq
+    }
+
+    val finalProcessing = (x : IndexedSeq[Any], func : Map[Int, GroupByCombiner]) => {
+      func.map(kvp => kvp._2.getFinalProcessing(x(kvp._1))).toIndexedSeq
+    }
+
+    val localFunctions = this.functions.map(kvp => (parentOp.outputSchema.getLocalIdFromGlobalId(kvp._1), kvp._2) )
+    val localValueFunctions = localFunctions.zipWithIndex.map(kvp => (kvp._2,kvp._1._2))//the location in the groupby columns
+
     val rddPair = parentOperators.head.execute(exec).map(rdd => (rdd, {
       if(this.parentCtx.args.contains("-incre") && cached.contains(rdd)){
         cached(rdd)
@@ -359,8 +370,17 @@ class GroupByOperator(parentOp : Operator,
       else
         groupBy(rdd)
     })).toMap
-    val unioned = this.parentCtx.ssc.sc.union[(IndexedSeq[Any],IndexedSeq[Any])](rddPair.values.toSeq)
-    val result = Array[RDD[IndexedSeq[Any]]](mergeBatch(unioned))
+
+    //val unioned = this.parentCtx.ssc.sc.union[(IndexedSeq[Any],IndexedSeq[Any])](rddPair.values.toSeq)
+    //val result = Array[RDD[IndexedSeq[Any]]](mergeBatch(unioned))
+    val unioned = rddPair.values
+      .map(_.mapValues(Seq(_)))
+      .reduce((r1, r2) => r1.cogroup(r2).mapValues(tp => tp._1.flatten ++ tp._2.flatten))
+      .mapValues(records => finalProcessing(records.reduce((x,y) => mergeCombiners(x,y,localValueFunctions)), localValueFunctions))
+
+
+    val result = Array(unioned.map(tp => tp._1 ++ tp._2))
+
     if(this.parentCtx.args.contains("-incre")){
       cached.foreach(kvp =>
         if(!rddPair.contains(kvp._1))

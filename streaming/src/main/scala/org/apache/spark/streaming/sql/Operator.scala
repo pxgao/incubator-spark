@@ -9,6 +9,8 @@ import scala.actors.Actor._
 import scala.actors.Actor
 import org.apache.spark.Accumulator
 import org.apache.spark.Partitioner.defaultPartitioner
+import org.apache.spark.broadcast.Broadcast
+
 /**
  * Created with IntelliJ IDEA.
  * User: peter
@@ -427,23 +429,23 @@ class GroupByOperator(parentOp : Operator,
 //    rr.map(arr => arr.toIndexedSeq)
   }
 
-  def mergeBatch(rdd : RDD[(IndexedSeq[Any],IndexedSeq[Any])]) : RDD[IndexedSeq[Any]] = {
-
-    val mergeCombiners = (x : IndexedSeq[Any], y : IndexedSeq[Any], func : Map[Int, GroupByCombiner]) => {
-      func.map(kvp => kvp._2.getMergeCombiners(x(kvp._1), y(kvp._1))).toIndexedSeq
-    }
-
-    val finalProcessing = (x : IndexedSeq[Any], func : Map[Int, GroupByCombiner]) => {
-      func.map(kvp => kvp._2.getFinalProcessing(x(kvp._1))).toIndexedSeq
-    }
-
-    val localFunctions = this.functions.map(kvp => (parentOp.outputSchema.getLocalIdFromGlobalId(kvp._1), kvp._2) )
-    val localValueFunctions = localFunctions.zipWithIndex.map(kvp => (kvp._2,kvp._1._2))//the location in the groupby columns
-
-    rdd.reduceByKey((x,y) => mergeCombiners(x,y,localValueFunctions))
-      .map(kvp => kvp._1 ++ finalProcessing(kvp._2,localValueFunctions))
-
-  }
+//  def mergeBatch(rdd : RDD[(IndexedSeq[Any],IndexedSeq[Any])]) : RDD[IndexedSeq[Any]] = {
+//
+//    val mergeCombiners = (x : IndexedSeq[Any], y : IndexedSeq[Any], func : Map[Int, GroupByCombiner]) => {
+//      func.map(kvp => kvp._2.getMergeCombiners(x(kvp._1), y(kvp._1))).toIndexedSeq
+//    }
+//
+//    val finalProcessing = (x : IndexedSeq[Any], func : Map[Int, GroupByCombiner]) => {
+//      func.map(kvp => kvp._2.getFinalProcessing(x(kvp._1))).toIndexedSeq
+//    }
+//
+//    val localFunctions = this.functions.map(kvp => (parentOp.outputSchema.getLocalIdFromGlobalId(kvp._1), kvp._2) )
+//    val localValueFunctions = localFunctions.zipWithIndex.map(kvp => (kvp._2,kvp._1._2))//the location in the groupby columns
+//
+//    rdd.reduceByKey((x,y) => mergeCombiners(x,y,localValueFunctions))
+//      .map(kvp => kvp._1 ++ finalProcessing(kvp._2,localValueFunctions))
+//
+//  }
 
   override def toString = super.toString + "keys:" + keyColumnsArr + " values:" + functions
 }
@@ -539,8 +541,9 @@ class InnerJoinOperator(parentOp1 : Operator,
                         parentCtx : SqlSparkStreamingContext) extends BinaryOperator {
   sqlContext = parentCtx
   sqlContext.operatorGraph.addOperator(this)
-  var getLocalIdFromGlobalId = Map[Int,Int]()
-  var localJoinCondition : IndexedSeq[(Int,Int)] = null
+  var getLocalIdFromGlobalId : Broadcast[Map[Int,Int]] = null
+  var localJoinCondition : Broadcast[IndexedSeq[(Int,Int)]] = null
+  var broadcastSchema : Broadcast[Schema] = null
   setParents(parentOp1, parentOp2)
   val leftJoinSet = joinCondition.map(tp=>tp._1).toSet
   val rightJoinSet = joinCondition.map(tp=>tp._2).toSet
@@ -566,12 +569,14 @@ class InnerJoinOperator(parentOp1 : Operator,
 
     val left = parentOp1.outputSchema.getLocalIdFromGlobalId
     val right = parentOp2.outputSchema.getLocalIdFromGlobalId.map(kvp => (kvp._1, kvp._2 + left.size))
-    getLocalIdFromGlobalId = left ++ right
+    getLocalIdFromGlobalId = this.parentCtx.ssc.sc.broadcast(left ++ right)
 
-    localJoinCondition = joinCondition.map(tp =>
+    localJoinCondition = this.parentCtx.ssc.sc.broadcast(joinCondition.map(tp =>
       (parentOperators(0).outputSchema.getLocalIdFromGlobalId(tp._1),
         parentOperators(1).outputSchema.getLocalIdFromGlobalId(tp._2))
-    )
+    ))
+
+    broadcastSchema = this.parentCtx.ssc.sc.broadcast(outputSchema)
   }
 
 
@@ -590,7 +595,7 @@ class InnerJoinOperator(parentOp1 : Operator,
       else{
         val localJoinCondition = this.localJoinCondition
         result.map(
-          record => (localJoinCondition.map(tp => record(tp._1)),record))
+          record => (localJoinCondition.value.map(tp => record(tp._1)),record))
           .partitionBy(defaultPartitioner(result))
       }
     )).toMap
@@ -614,7 +619,7 @@ class InnerJoinOperator(parentOp1 : Operator,
       else{
         val localJoinCondition = this.localJoinCondition
         result.map(
-          record => (localJoinCondition.map(tp => record(tp._1)),record))
+          record => (localJoinCondition.value.map(tp => record(tp._1)),record))
           .partitionBy(defaultPartitioner(result))
       }
       )).toMap
@@ -669,7 +674,7 @@ class InnerJoinOperator(parentOp1 : Operator,
     val joined = leftPartitioned.join(rightPartitioned)
     val result = joined.map(pair => {
       val combined = pair._2._1 ++ pair._2._2
-      outputSchema.getSchemaArray.map(kvp => combined(getLocalIdFromGlobalId(kvp._2)))
+      outputSchema.getSchemaArray.map(kvp => combined(getLocalIdFromGlobalId.value(kvp._2)))
     }
     )
 

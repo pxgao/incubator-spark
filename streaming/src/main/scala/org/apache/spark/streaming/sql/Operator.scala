@@ -4,11 +4,7 @@ import org.apache.spark.streaming._
 import org.apache.spark.rdd.RDD
 import scala.collection.mutable
 import org.apache.spark.SparkContext._
-import scala.collection.mutable.ArrayBuffer
-import scala.actors.Actor._
-import scala.actors.Actor
-import org.apache.spark.{HashPartitioner, Accumulator}
-import org.apache.spark.Partitioner.defaultPartitioner
+import org.apache.spark.HashPartitioner
 import org.apache.spark.broadcast.Broadcast
 
 /**
@@ -644,19 +640,26 @@ class InnerJoinOperator(parentOp1 : Operator,
 
     var result = Map[(RDD[IndexedSeq[Any]], RDD[IndexedSeq[Any]]), RDD[IndexedSeq[Any]]]()
 
-    for(leftRdd <- leftParentResult ; rightRdd <- rightParentResult){
-      val res :  RDD[IndexedSeq[Any]] =
-        if(this.parentCtx.args.contains("-incre") && cached.contains((leftRdd, rightRdd))){
-          cached((leftRdd, rightRdd))
-        }
-        else
-        {
-          val leftShuffled = leftShuffleMap(leftRdd)
-          val rightShuffled = rightShuffleMap(rightRdd)
-          join(leftShuffled, rightShuffled)
-        }
-      result += (leftRdd, rightRdd) -> res
-    }
+
+    val leftUnioned = leftShuffleMap.values
+      .map(rdd => rdd.mapValues(Seq(_)))
+      .reduce((r1, r2) => r1.cogroup(r2).mapValues(tp => tp._1.flatten ++ tp._2.flatten)).mapValues(_.head)
+
+
+//    for(leftRdd <- leftParentResult ; rightRdd <- rightParentResult){
+//      val res :  RDD[IndexedSeq[Any]] =
+//        if(this.parentCtx.args.contains("-incre") && cached.contains((leftRdd, rightRdd)))
+//        {
+//          cached((leftRdd, rightRdd))
+//        }
+//        else
+//        {
+//          val leftShuffled = leftShuffleMap(leftRdd)
+//          val rightShuffled = rightShuffleMap(rightRdd)
+//          join(leftShuffled, rightShuffled)
+//        }
+//      result += (leftRdd, rightRdd) -> res
+//    }
 
 
     if(this.parentCtx.args.contains("-incre")){

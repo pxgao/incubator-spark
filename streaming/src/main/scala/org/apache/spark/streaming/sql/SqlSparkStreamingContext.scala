@@ -3,10 +3,7 @@ package org.apache.spark.streaming.sql
 import org.apache.spark.streaming._
 import org.apache.spark.rdd.RDD
 import scala.actors.Actor._
-import scala.actors.Actor
-import scala.io._
 import java.io.{File, PrintWriter}
-import java.util.Calendar
 import scala.Tuple2
 
 

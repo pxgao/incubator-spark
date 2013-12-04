@@ -984,7 +984,11 @@ abstract class RDD[T: ClassManifest](
   /** A description of this RDD and its recursive dependencies for debugging. */
   def toDebugString: String = {
     def debugString(rdd: RDD[_], prefix: String = ""): Seq[String] = {
-      Seq(prefix + rdd + " (" + rdd.partitions.size + " partitions)") ++
+
+
+      Seq(
+        prefix + rdd + " (" + rdd.partitions.size + " partitions) Cached:"
+        + this.sparkContext.persistentRdds.contains(rdd.id) + " " + rdd.getStorageLevel) ++
         rdd.dependencies.flatMap(d => debugString(d.rdd, prefix + "  "))
     }
     debugString(this).mkString("\n")

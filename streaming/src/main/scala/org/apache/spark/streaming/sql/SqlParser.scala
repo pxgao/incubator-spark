@@ -1,6 +1,5 @@
 package org.apache.spark.streaming.sql
 
-import scala.util.parsing.combinator.syntactical._
 import scala.io.Source
 
 import scala.util.parsing.combinator._
